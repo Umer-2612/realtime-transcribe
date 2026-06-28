@@ -115,8 +115,7 @@
         ws = new WebSocket(WS_URL);
 
         ws.onopen = () => {
-          // Send init message — same format as aural-oss RelayConnector
-          ws.send(JSON.stringify({ type: "mic_test", language: "zh" }));
+          ws.send(JSON.stringify({ type: "start", language: "en" }));
         };
 
         ws.onmessage = (e) => {
@@ -129,9 +128,8 @@
             return;
           }
 
-          if (msg.type === "asr") {
-            // Partial result — update the last (in-progress) line
-            const text = msg.data?.results?.[0]?.text ?? "";
+          if (msg.type === "partial") {
+            const text = (msg.text || "").trim();
             if (!text) return;
             if (lines.length === 0 || lines[lines.length - 1].final) {
               lines.push({ text, final: false });
@@ -142,8 +140,7 @@
             return;
           }
 
-          if (msg.type === "asr_ended") {
-            // Final result — commit the last line
+          if (msg.type === "final") {
             const text = (msg.text || "").trim();
             if (!text) return;
             if (lines.length > 0 && !lines[lines.length - 1].final) {
