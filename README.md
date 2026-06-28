@@ -1,122 +1,174 @@
-# Real-time Transcribe
+# realtime-transcribe — WebSocket Transcription Service
 
-A local, real-time speech transcription system powered by [FunASR](https://github.com/modelscope/FunASR). Speak into your browser microphone and see live partial + final transcriptions streamed back instantly.
+A self-hosted WebSocket service that accepts raw audio streams and returns live transcriptions using [FunASR](https://github.com/modelscope/FunASR).
 
-## How it works
+**Default endpoint:** `ws://localhost:8765`
 
-```
-Browser (mic) → AudioWorklet → hex PCM → WebSocket → Python server → FunASR model → transcript
-```
+---
 
-- **`transcribe_server.py`** — Python WebSocket server (port 8765) that loads a FunASR model and returns `asr` (partial) and `asr_ended` (final) events.
-- **`client/`** — Static HTML/JS frontend served over HTTP (port 3000). Captures mic at 16 kHz, encodes as Int16 hex, and streams to the server.
-
-## Supported models
-
-| Model ID | Mode | Languages |
-|---|---|---|
-| `iic/SenseVoiceSmall` *(default)* | Offline — ~1 s lag, highest accuracy | en, zh, ja, ko, yue |
-| `paraformer-zh-streaming` | Streaming — lowest latency | Chinese only |
-
-Change the `MODEL_ID` and `LANGUAGE` constants at the top of `transcribe_server.py` to switch models.
-
-## Requirements
-
-- Python **3.12**
-- PyTorch (CPU or CUDA)
-- A working microphone
-- A modern browser (Chrome/Edge recommended — Firefox may need flags for AudioWorklet)
-
-## Setup
-
-### 1. Create and activate the virtual environment
+## Quick start
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate   # macOS / Linux
-# .venv\Scripts\activate    # Windows
-```
-
-### 2. Install dependencies
-
-```bash
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-> First run also downloads the FunASR model (~300 MB for SenseVoiceSmall). This happens automatically when the server starts.
-
-## Running
-
-You need **two terminal windows** open at the same time.
-
-### Terminal 1 — WebSocket transcription server
-
-```bash
-source .venv/bin/activate
 python transcribe_server.py
 ```
 
-You'll see `[server] Model ready.` and `[server] Listening on ws://0.0.0.0:8765` when it's ready.
+The service prints `Model ready.` then `Listening on ws://0.0.0.0:8765` when ready.
 
-### Terminal 2 — Static file server for the browser client
-
-```bash
-python -m http.server 3000 -d client
-```
-
-### Open the app
-
-Navigate to [http://localhost:3000](http://localhost:3000) in your browser, click the microphone button, and start speaking.
-
-## Project structure
-
-```
-realtime-transcribe/
-├── transcribe_server.py   # FunASR WebSocket server
-├── requirements.txt       # Python dependencies
-├── client/
-│   ├── index.html         # Browser UI
-│   └── worklet.js         # AudioWorklet mic processor
-└── .python-version        # Pins Python 3.12 (used by pyenv)
-```
-
-## WebSocket protocol
-
-The browser and server communicate over `ws://localhost:8765` using JSON messages.
-
-**Browser → Server**
-
-| Message | Description |
-|---|---|
-| `{ "type": "mic_test", "language": "en" }` | Session init |
-| `{ "type": "audio", "data": "<hex int16 PCM>" }` | 256 ms audio chunk |
-| `{ "type": "end" }` | Stop and flush |
-
-**Server → Browser**
-
-| Message | Description |
-|---|---|
-| `{ "type": "ready" }` | Model loaded, session open |
-| `{ "type": "asr", "data": { "results": [{ "text": "...", "definite": false }] } }` | Partial transcript |
-| `{ "type": "asr_ended", "text": "..." }` | Final committed transcript |
-| `{ "type": "timeout" }` | Session expired (10 min) |
+---
 
 ## Configuration
 
-All tuneable constants are at the top of `transcribe_server.py`:
+All settings are controlled via environment variables.
 
-| Constant | Default | Description |
+| Variable | Default | Description |
 |---|---|---|
-| `MODEL_ID` | `iic/SenseVoiceSmall` | FunASR model to load |
-| `LANGUAGE` | `en` | Language hint for offline models |
+| `PORT` | `8765` | WebSocket port |
+| `MODEL_ID` | `iic/SenseVoiceSmall` | FunASR model. See models below. |
+| `LANGUAGE` | `en` | Default language hint (`en`, `zh`, `ja`, `ko`, `auto`) |
 | `SILENCE_MS` | `1500` | Silence duration (ms) that triggers a final flush |
 | `RMS_THRESHOLD` | `0.01` | RMS level below which audio is treated as silence |
-| `SESSION_TIMEOUT` | `600` | Auto-close idle session after N seconds |
+| `SESSION_TIMEOUT` | `600` | Seconds before an idle session is closed |
 
-## Troubleshooting
+```bash
+PORT=9000 MODEL_ID=iic/SenseVoiceSmall LANGUAGE=auto python transcribe_server.py
+```
 
-**Mic not working in the browser** — The AudioWorklet API requires the page to be served over HTTP (not `file://`). Always use `python -m http.server 3000 -d client`.
+### Available models
 
-**Model downloads on first run** — FunASR fetches the model weights from ModelScope automatically. Ensure you have internet access the first time.
+| `MODEL_ID` | Mode | Languages | Latency |
+|---|---|---|---|
+| `iic/SenseVoiceSmall` *(default)* | Offline | en, zh, ja, ko, yue | ~1 s |
+| `paraformer-zh-streaming` | Streaming | zh only | ~250 ms |
 
-**Port conflicts** — Change `PORT = 8765` in `transcribe_server.py` and update `WS_URL` in `client/index.html` to match.
+Models are downloaded automatically from ModelScope on first run.
+
+---
+
+## Protocol
+
+### 1. Connect
+
+```
+ws://localhost:8765
+```
+
+On connection the service immediately sends:
+
+```json
+{ "type": "ready" }
+```
+
+Do not send audio until you receive this.
+
+---
+
+### 2. Messages you send
+
+#### `start` — begin a session
+
+Send once after `ready`. Optional, but lets you set a per-session language.
+
+```json
+{ "type": "start", "language": "en" }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `language` | string | `en`, `zh`, `ja`, `ko`, `yue`, `auto` — overrides server default |
+
+#### `audio` — stream a chunk
+
+Send continuously while recording. Each chunk must be exactly **256 ms** of audio.
+
+```json
+{ "type": "audio", "data": "1a2b3c..." }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `data` | string | Hex-encoded **Int16 PCM**, **16 kHz**, **mono**. Each chunk = 4096 samples = 8192 bytes → 16384 hex chars. |
+
+**Audio format:**
+- Sample rate: **16 000 Hz**
+- Encoding: **Int16 (signed 16-bit little-endian)**
+- Channels: **mono**
+- Chunk size: **4096 samples** (256 ms)
+
+#### `end` — stop and flush
+
+Tells the service to finalize any buffered audio and emit the last `final` result.
+
+```json
+{ "type": "end" }
+```
+
+---
+
+### 3. Messages you receive
+
+#### `partial` — in-progress transcript
+
+Emitted roughly every 1 second while the speaker is talking. Text may change with each update.
+
+```json
+{ "type": "partial", "text": "hello how are" }
+```
+
+#### `final` — committed transcript
+
+Emitted after a pause in speech (`SILENCE_MS`) or when you send `end`. Represents one complete utterance.
+
+```json
+{ "type": "final", "text": "Hello, how are you?" }
+```
+
+#### `timeout`
+
+Session has been idle for `SESSION_TIMEOUT` seconds. Connection is closed after this.
+
+```json
+{ "type": "timeout" }
+```
+
+#### `error`
+
+Sent when the service receives malformed input.
+
+```json
+{ "type": "error", "message": "audio data must be hex-encoded int16 PCM" }
+```
+
+---
+
+## Typical session flow
+
+```
+CLIENT                          SERVICE
+  |                                |
+  |── connect ─────────────────────▶|
+  |◀──────────────── {"type":"ready"}
+  |                                |
+  |── {"type":"start","language":"en"}
+  |── {"type":"audio","data":"..."} |
+  |── {"type":"audio","data":"..."} |
+  |◀──────── {"type":"partial","text":"hello"}
+  |── {"type":"audio","data":"..."} |
+  |── {"type":"audio","data":"..."} |
+  |◀──────── {"type":"partial","text":"hello world"}
+  |                                |
+  |   (speaker pauses)             |
+  |◀────────── {"type":"final","text":"Hello world."}
+  |                                |
+  |── {"type":"end"} ──────────────▶|
+  |── disconnect ──────────────────▶|
+```
+
+---
+
+## Requirements
+
+- Python 3.12
+- PyTorch 2.0+ (CPU or CUDA)
+- Dependencies: `pip install -r requirements.txt`
