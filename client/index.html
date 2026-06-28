@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Real-time Transcribe</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e5e5e5; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 24px; }
+    h1  { font-size: 1.2rem; font-weight: 500; color: #888; letter-spacing: 0.05em; text-transform: uppercase; }
+
+    #btn {
+      width: 80px; height: 80px; border-radius: 50%; border: none; cursor: pointer;
+      background: #1d4ed8; color: #fff; font-size: 1.8rem; transition: all .15s;
+      display: flex; align-items: center; justify-content: center;
+    }
+    #btn.recording { background: #dc2626; animation: pulse 1.2s ease-in-out infinite; }
+    #btn:disabled  { opacity: .4; cursor: not-allowed; }
+    @keyframes pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.08); } }
+
+    #status { font-size: .8rem; color: #555; height: 18px; }
+
+    #transcript-box {
+      width: min(640px, 90vw); min-height: 140px; max-height: 360px;
+      overflow-y: auto; background: #1a1a1a; border: 1px solid #2a2a2a;
+      border-radius: 12px; padding: 16px; font-size: 1rem; line-height: 1.6;
+    }
+    .partial { color: #6b7280; }   /* grey  — in-progress */
+    .final   { color: #e5e5e5; }   /* white — committed    */
+    .empty   { color: #374151; font-style: italic; }
+
+    #level-bar { width: min(640px, 90vw); height: 4px; background: #1a1a1a; border-radius: 2px; }
+    #level-fill { height: 100%; width: 0%; background: #1d4ed8; border-radius: 2px; transition: width .05s; }
+  </style>
+</head>
+<body>
+  <h1>Real-time Transcribe</h1>
+
+  <div id="level-bar"><div id="level-fill"></div></div>
+
+  <button id="btn" title="Start / stop recording">🎙️</button>
+  <div id="status">Click the mic to start</div>
+
+  <div id="transcript-box">
+    <span class="empty">Transcription will appear here…</span>
+  </div>
+
+  <!--
+    Service 1 — Audio producer (this page):
+      Captures mic via AudioWorklet at 16 kHz.
+      Converts Float32 → Int16 → hex string.
+      Streams to Service 2 via WebSocket.
+
+    Service 2 — Transcriber (transcribe_server.py):
+      Receives hex audio chunks.
+      Runs FunASR streaming model locally.
+      Sends back partial / final transcript events.
+
+    Protocol is identical to aural-oss's voice-relay mic_test mode,
+    so the same browser-side code works with either server.
+  -->
+  <script>
+    // Guard: AudioWorklet + getUserMedia both require HTTP (not file://).
+    if (location.protocol === "file:") {
+      document.body.innerHTML = `<div style="color:#f87171;font-family:monospace;padding:2rem;max-width:640px">
+        <b>Must be served over HTTP.</b><br><br>
+        Run in your terminal:<br><br>
+        <code>python -m http.server 3000 -d client</code><br><br>
+        Then open <a href="http://localhost:3000" style="color:#60a5fa">http://localhost:3000</a>
+      </div>`;
+      throw new Error("Opened via file:// — serve over HTTP instead.");
+    }
+
+    // ── Config ─────────────────────────────────────────────────────────────
+    const WS_URL       = "ws://localhost:8765";
+    const SAMPLE_RATE  = 16000;
+    const CHUNK_FRAMES = 4096;   // 256 ms @ 16 kHz  (matches aural-oss AudioWorklet)
+
+    // ── UI refs ────────────────────────────────────────────────────────────
+    const btn        = document.getElementById("btn");
+    const status     = document.getElementById("status");
+    const box        = document.getElementById("transcript-box");
+    const levelFill  = document.getElementById("level-fill");
+
+    // ── State ──────────────────────────────────────────────────────────────
+    let ws            = null;
+    let audioCtx      = null;
+    let workletNode   = null;
+    let micStream     = null;
+    let recording     = false;
+
+    // Transcript lines: array of { text, final }
+    let lines = [];
+
+    // ── Transcript rendering ───────────────────────────────────────────────
+    function renderTranscript() {
+      if (lines.length === 0) {
+        box.innerHTML = '<span class="empty">Transcription will appear here…</span>';
+        return;
+      }
+      box.innerHTML = lines.map((l, i) => {
+        const cls = l.final ? "final" : "partial";
+        const cursor = (!l.final && i === lines.length - 1) ? " ▌" : "";
+        return `<span class="${cls}">${escHtml(l.text)}${cursor}</span>`;
+      }).join(" ");
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function escHtml(s) {
+      return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    }
+
+    // ── WebSocket ──────────────────────────────────────────────────────────
+    function connectWS() {
+      return new Promise((resolve, reject) => {
+        ws = new WebSocket(WS_URL);
+
+        ws.onopen = () => {
+          // Send init message — same format as aural-oss RelayConnector
+          ws.send(JSON.stringify({ type: "mic_test", language: "zh" }));
+        };
+
+        ws.onmessage = (e) => {
+          let msg;
+          try { msg = JSON.parse(e.data); } catch { return; }
+
+          if (msg.type === "ready") {
+            setStatus("Connected — listening…");
+            resolve();
+            return;
+          }
+
+          if (msg.type === "asr") {
+            // Partial result — update the last (in-progress) line
+            const text = msg.data?.results?.[0]?.text ?? "";
+            if (!text) return;
+            if (lines.length === 0 || lines[lines.length - 1].final) {
+              lines.push({ text, final: false });
+            } else {
+              lines[lines.length - 1].text = text;
+            }
+            renderTranscript();
+            return;
+          }
+
+          if (msg.type === "asr_ended") {
+            // Final result — commit the last line
+            const text = (msg.text || "").trim();
+            if (!text) return;
+            if (lines.length > 0 && !lines[lines.length - 1].final) {
+              lines[lines.length - 1] = { text, final: true };
+            } else {
+              lines.push({ text, final: true });
+            }
+            renderTranscript();
+            return;
+          }
+
+          if (msg.type === "timeout") {
+            setStatus("Session timed out");
+            stopRecording();
+          }
+
+          if (msg.type === "error") {
+            setStatus(`Server error: ${msg.message ?? "unknown"}`);
+          }
+        };
+
+        ws.onerror = () => reject(new Error("WebSocket error"));
+        ws.onclose = () => {
+          if (recording) setStatus("Disconnected");
+        };
+      });
+    }
+
+    // ── Audio worklet (copied from aural-oss use-relay-asr-input.ts) ───────
+    // Processes mic input in 4096-sample chunks:
+    //   Float32 audio → Int16 PCM → hex string → WebSocket
+    // worklet.js must be served over HTTP — it cannot load via file://
+
+    async function startAudio() {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+      if (audioCtx.state === "suspended") await audioCtx.resume();
+
+      // Load worklet from separate file (requires HTTP server, not file://)
+      await audioCtx.audioWorklet.addModule("./worklet.js");
+
+      const source  = audioCtx.createMediaStreamSource(micStream);
+      workletNode   = new AudioWorkletNode(audioCtx, "mic-processor");
+
+      // Silence sink — prevent feedback
+      const sink    = audioCtx.createGain();
+      sink.gain.value = 0;
+      source.connect(workletNode);
+      workletNode.connect(sink);
+      sink.connect(audioCtx.destination);
+
+      // Level meter
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      const levelData = new Uint8Array(analyser.frequencyBinCount);
+      function updateLevel() {
+        if (!recording) return;
+        analyser.getByteTimeDomainData(levelData);
+        let sum = 0;
+        for (let i = 0; i < levelData.length; i++) {
+          const v = (levelData[i] - 128) / 128;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / levelData.length);
+        levelFill.style.width = Math.min(100, rms * 400) + "%";
+        requestAnimationFrame(updateLevel);
+      }
+      requestAnimationFrame(updateLevel);
+
+      // Send each chunk over WebSocket as hex-encoded int16 PCM
+      workletNode.port.onmessage = (e) => {
+        if (!recording || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+        const floats = e.data;   // Float32Array, 4096 samples
+
+        // Float32 → Int16
+        const int16 = new Int16Array(floats.length);
+        for (let i = 0; i < floats.length; i++) {
+          int16[i] = Math.max(-32768, Math.min(32767, floats[i] * 32768));
+        }
+
+        // Int16 → hex string (same encoding as aural-oss)
+        const bytes = new Uint8Array(int16.buffer);
+        let hex = "";
+        for (let i = 0; i < bytes.length; i++) {
+          hex += bytes[i].toString(16).padStart(2, "0");
+        }
+
+        ws.send(JSON.stringify({ type: "audio", data: hex }));
+      };
+    }
+
+    function stopAudio() {
+      workletNode?.disconnect();
+      workletNode = null;
+      audioCtx?.close();
+      audioCtx = null;
+      micStream?.getTracks().forEach(t => t.stop());
+      micStream = null;
+      levelFill.style.width = "0%";
+    }
+
+    // ── Start / stop ───────────────────────────────────────────────────────
+    async function startRecording() {
+      btn.disabled = true;
+      setStatus("Connecting…");
+      try {
+        await connectWS();
+        await startAudio();
+        recording = true;
+        btn.classList.add("recording");
+        btn.innerHTML = "⏹️";
+      } catch (err) {
+        setStatus(`Error: ${err.message}`);
+        stopAudio();
+        ws?.close();
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function stopRecording() {
+      if (!recording) return;
+      recording = false;
+      btn.classList.remove("recording");
+      btn.innerHTML = "🎙️";
+      setStatus("Stopped");
+      // Tell server to flush any buffered audio
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "end" }));
+        ws.close();
+      }
+      stopAudio();
+    }
+
+    btn.addEventListener("click", () => {
+      if (recording) stopRecording();
+      else           startRecording();
+    });
+
+    function setStatus(msg) { status.textContent = msg; }
+  </script>
+</body>
+</html>
