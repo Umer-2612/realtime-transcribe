@@ -9,12 +9,29 @@ A self-hosted WebSocket service that accepts raw audio streams and returns live 
 ## Quick start
 
 ```bash
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python transcribe_server.py
+make install   # create .venv and install dependencies
+make run       # start the WebSocket service on ws://localhost:8765
 ```
 
 The service prints `Model ready.` then `Listening on ws://0.0.0.0:8765` when ready.
+
+### All make commands
+
+| Command | Description |
+|---|---|
+| `make install` | Create `.venv` (Python 3.12) and install dependencies |
+| `make run` | Start the transcription service |
+| `make example` | Serve the browser demo at `http://localhost:3000` |
+| `make clean` | Remove `__pycache__` directories |
+
+### Without make
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
 
 ---
 
@@ -32,7 +49,7 @@ All settings are controlled via environment variables.
 | `SESSION_TIMEOUT` | `600` | Seconds before an idle session is closed |
 
 ```bash
-PORT=9000 MODEL_ID=iic/SenseVoiceSmall LANGUAGE=auto python transcribe_server.py
+PORT=9000 MODEL_ID=iic/SenseVoiceSmall LANGUAGE=auto make run
 ```
 
 ### Available models
