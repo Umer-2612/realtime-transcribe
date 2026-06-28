@@ -12,6 +12,7 @@ __pycache__/
 # FunASR / ModelScope model cache (downloaded at runtime)
 .cache/
 modelscope_cache/
+.codegraph/
 
 # OS
 .DS_Store
