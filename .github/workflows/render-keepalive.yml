@@ -1,0 +1,22 @@
+name: Render Keepalive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    env:
+      RENDER_SERVICE_URL: ${{ secrets.RENDER_SERVICE_URL }}
+    steps:
+      - name: Ping Render health endpoint
+        run: |
+          if [ -z "${RENDER_SERVICE_URL:-}" ]; then
+            echo "Set the RENDER_SERVICE_URL repository secret to enable keepalive pings."
+            exit 0
+          fi
+
+          url="${RENDER_SERVICE_URL%/}/health"
+          curl -fsS --max-time 20 --retry 2 "$url"

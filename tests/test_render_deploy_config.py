@@ -48,6 +48,24 @@ class RenderDeployConfigTest(unittest.TestCase):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, text)
 
+    def test_github_actions_keepalive_pings_render_health_endpoint(self):
+        workflow = ROOT / ".github" / "workflows" / "render-keepalive.yml"
+
+        self.assertTrue(workflow.exists(), "GitHub Actions keepalive workflow is required")
+
+        text = workflow.read_text()
+        required_snippets = [
+            "cron: \"*/10 * * * *\"",
+            "workflow_dispatch:",
+            "RENDER_SERVICE_URL",
+            "${RENDER_SERVICE_URL%/}/health",
+            "curl -fsS",
+        ]
+
+        for snippet in required_snippets:
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, text)
+
 
 if __name__ == "__main__":
     unittest.main()

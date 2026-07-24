@@ -66,19 +66,40 @@ Models are downloaded automatically from ModelScope on first run.
 
 This repo is ready for Render blueprint deploys through `render.yaml`. Render builds the Docker image, injects the configured environment variables, and uses `/health` as the service health check.
 
-### 1. Push the repo
-
-```bash
-git push origin main
-```
-
-### 2. Create the Render service
+### 1. Create the Render service
 
 1. Open Render and choose **New > Blueprint**.
 2. Connect this GitHub repository.
-3. Select the branch you pushed.
+3. Select the `service` branch, or whichever branch contains `render.yaml`.
 4. Confirm the `realtime-transcribe` web service from `render.yaml`.
 5. Use at least the `standard` instance type. FunASR and Torch are too heavy for small free instances.
+
+If you create the service manually instead of using the blueprint, use these settings:
+
+| Field | Value |
+|---|---|
+| Root Directory | Leave blank / repository root |
+| Runtime | Docker |
+| Dockerfile Path | `./Dockerfile` |
+| Docker Context | `.` |
+| Build Command | Leave blank |
+| Start Command | Leave blank |
+| Health Check Path | `/health` |
+
+Docker services use the `CMD ["python", "main.py"]` instruction in the Dockerfile unless you explicitly set a Docker command.
+
+### 2. Environment variables
+
+The blueprint defines these defaults:
+
+| Variable | Value |
+|---|---|
+| `PORT` | `8765` |
+| `MODEL_ID` | `iic/SenseVoiceSmall` |
+| `LANGUAGE` | `en` |
+| `SILENCE_MS` | `1500` |
+| `RMS_THRESHOLD` | `0.01` |
+| `SESSION_TIMEOUT` | `600` |
 
 ### 3. Verify the deployment
 
@@ -100,7 +121,19 @@ Use WebSocket Secure for transcription traffic:
 wss://<your-render-service>.onrender.com
 ```
 
-### 4. Connect the frontend
+### 4. Keepalive pings
+
+The repo includes `.github/workflows/render-keepalive.yml`, which pings the Render health endpoint every 10 minutes.
+
+After Render gives you the service URL, add this GitHub repository secret:
+
+```text
+RENDER_SERVICE_URL=https://<your-render-service>.onrender.com
+```
+
+GitHub scheduled workflows run from the repository's default branch, so make sure this workflow is on the default branch if you rely on scheduled pings. You can also run it manually from the **Actions** tab.
+
+### 5. Connect the frontend
 
 Set this in your frontend staging/production environment:
 
