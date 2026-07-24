@@ -22,6 +22,7 @@ The service prints `Model ready.` then `Listening on ws://0.0.0.0:8765` when rea
 | `make install` | Create `.venv` (Python 3.12) and install dependencies |
 | `make run` | Start the transcription service |
 | `make example` | Serve the browser demo at `http://localhost:3000` |
+| `make test` | Run deployment/config tests |
 | `make clean` | Remove `__pycache__` directories |
 
 ### Without make
@@ -32,8 +33,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 python main.py
 ```
-
----
 
 ## Configuration
 
@@ -60,6 +59,56 @@ PORT=9000 MODEL_ID=iic/SenseVoiceSmall LANGUAGE=auto make run
 | `paraformer-zh-streaming` | Streaming | zh only | ~250 ms |
 
 Models are downloaded automatically from ModelScope on first run.
+
+---
+
+## Deploy to Render
+
+This repo is ready for Render blueprint deploys through `render.yaml`. Render builds the Docker image, injects the configured environment variables, and uses `/health` as the service health check.
+
+### 1. Push the repo
+
+```bash
+git push origin main
+```
+
+### 2. Create the Render service
+
+1. Open Render and choose **New > Blueprint**.
+2. Connect this GitHub repository.
+3. Select the branch you pushed.
+4. Confirm the `realtime-transcribe` web service from `render.yaml`.
+5. Use at least the `standard` instance type. FunASR and Torch are too heavy for small free instances.
+
+### 3. Verify the deployment
+
+Render exposes HTTPS for health checks:
+
+```bash
+curl https://<your-render-service>.onrender.com/health
+```
+
+Expected response:
+
+```json
+{"status":"ok","service":"realtime-transcribe"}
+```
+
+Use WebSocket Secure for transcription traffic:
+
+```text
+wss://<your-render-service>.onrender.com
+```
+
+### 4. Connect the frontend
+
+Set this in your frontend staging/production environment:
+
+```env
+NEXT_PUBLIC_FUNASR_URL=wss://<your-render-service>.onrender.com
+```
+
+Redeploy the frontend after changing the env.
 
 ---
 

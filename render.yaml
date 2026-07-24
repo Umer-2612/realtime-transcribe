@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: realtime-transcribe
+    runtime: docker
+    plan: standard
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8765"
+      - key: MODEL_ID
+        value: "iic/SenseVoiceSmall"
+      - key: LANGUAGE
+        value: "en"
+      - key: SILENCE_MS
+        value: "1500"
+      - key: RMS_THRESHOLD
+        value: "0.01"
+      - key: SESSION_TIMEOUT
+        value: "600"

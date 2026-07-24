@@ -1,4 +1,4 @@
-.PHONY: install run example clean
+.PHONY: install run example test clean
 
 install:
 	python3.12 -m venv .venv
@@ -9,6 +9,9 @@ run:
 
 example:
 	python -m http.server 3000 -d examples/browser
+
+test:
+	.venv/bin/python -m unittest discover -s tests
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +

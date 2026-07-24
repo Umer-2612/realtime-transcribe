@@ -3,14 +3,27 @@ import asyncio
 import sys
 
 import websockets
+from websockets.datastructures import Headers
+from websockets.http11 import Response
 
 from app.config import PORT
 from app.handler import handle
 
 
+def health_check(_connection, request):
+    if request.path not in {"/", "/health"}:
+        return None
+
+    body = b'{"status":"ok","service":"realtime-transcribe"}\n'
+    headers = Headers()
+    headers["Content-Type"] = "application/json"
+    headers["Content-Length"] = str(len(body))
+    return Response(200, "OK", headers, body)
+
+
 async def main():
     print(f"[service] Listening on ws://0.0.0.0:{PORT}", flush=True)
-    async with websockets.serve(handle, "0.0.0.0", PORT):
+    async with websockets.serve(handle, "0.0.0.0", PORT, process_request=health_check):
         await asyncio.Future()
 
 
