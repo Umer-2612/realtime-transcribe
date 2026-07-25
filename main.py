@@ -10,7 +10,16 @@ from app.config import PORT
 from app.handler import handle
 
 
+def is_websocket_upgrade(request):
+    connection = request.headers.get("Connection", "")
+    upgrade = request.headers.get("Upgrade", "")
+    return "upgrade" in connection.lower() or upgrade.lower() == "websocket"
+
+
 def health_check(_connection, request):
+    if is_websocket_upgrade(request):
+        return None
+
     if request.path not in {"/", "/health"}:
         return None
 
