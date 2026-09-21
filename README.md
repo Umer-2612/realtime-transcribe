@@ -43,12 +43,25 @@ All settings are controlled via environment variables.
 | `PORT` | `8765` | WebSocket port |
 | `MODEL_ID` | `iic/SenseVoiceSmall` | FunASR model. See models below. |
 | `LANGUAGE` | `en` | Default language hint (`en`, `zh`, `ja`, `ko`, `auto`) |
-| `SILENCE_MS` | `1500` | Silence duration (ms) that triggers a final flush |
+| `SILENCE_MS` | `1500` | Silence duration (ms) that forces a final flush. Hard ceiling even with turn detection on |
 | `RMS_THRESHOLD` | `0.01` | RMS level below which audio is treated as silence |
 | `SESSION_TIMEOUT` | `600` | Seconds before an idle session is closed |
+| `TURN_DETECTION_ENABLED` | `true` | Use [vogent-turn](https://github.com/vogent/vogent-turn) to end turns on model confidence instead of waiting the full `SILENCE_MS`. Requires an `HF_TOKEN` with access granted to the gated `vogent/Vogent-Turn-80M` repo; falls back to the plain `SILENCE_MS` timer if the model can't load |
+| `TURN_MODEL_ID` | `vogent/Vogent-Turn-80M` | Hugging Face model id for turn detection |
+| `TURN_MODEL_REVISION` | *(none)* | Pin a specific model revision |
+| `TURN_COMPILE_MODEL` | `false` | Enable `torch.compile` for the turn model (slower startup, faster inference) |
+| `TURN_PROB_THRESHOLD` | `0.5` | Minimum `prob_endpoint` to treat a pause as a finished turn |
+| `TURN_DEBOUNCE_MS` | `300` | Silence (ms) before the first turn-detector check; also the minimum gap between checks |
+| `TURN_AUDIO_WINDOW_S` | `8` | Seconds of trailing audio fed to the turn detector (model max is 8s) |
 
 ```bash
 PORT=9000 MODEL_ID=iic/SenseVoiceSmall LANGUAGE=auto make run
+```
+
+Turn detection needs its own Hugging Face token:
+
+```bash
+HF_TOKEN=hf_xxx make run
 ```
 
 ### Available models
@@ -167,15 +180,28 @@ Do not send audio until you receive this.
 
 #### `start` — begin a session
 
-Send once after `ready`. Optional, but lets you set a per-session language.
+Send once after `ready`. Optional, but lets you set a per-session language and seed turn-detection context.
 
 ```json
-{ "type": "start", "language": "en" }
+{ "type": "start", "language": "en", "prev_line": "What is your phone number" }
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `language` | string | `en`, `zh`, `ja`, `ko`, `yue`, `auto` — overrides server default |
+| `prev_line` | string | The other speaker's last line (e.g. the interviewer's question). Used by turn detection to judge whether the candidate's answer is finished. Ignored if `TURN_DETECTION_ENABLED` is off |
+
+#### `context` — update turn-detection context mid-session
+
+Send whenever the other speaker's line changes (e.g. the interviewer asks the next question), so turn detection keeps judging pauses against the current prompt instead of a stale one.
+
+```json
+{ "type": "context", "prev_line": "Tell me about a time you disagreed with a teammate" }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `prev_line` | string | Replaces the session's turn-detection context. Omit or send `""` to clear it |
 
 #### `audio` — stream a chunk
 
@@ -217,7 +243,7 @@ Emitted roughly every 1 second while the speaker is talking. Text may change wit
 
 #### `final` — committed transcript
 
-Emitted after a pause in speech (`SILENCE_MS`) or when you send `end`. Represents one complete utterance.
+Emitted when a pause looks like a finished turn (via `vogent-turn`, or after `SILENCE_MS` if turn detection is off or unavailable), or when you send `end`. Represents one complete utterance.
 
 ```json
 { "type": "final", "text": "Hello, how are you?" }
