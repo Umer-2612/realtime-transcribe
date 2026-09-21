@@ -4,24 +4,56 @@ A self-hosted WebSocket service that accepts raw audio streams and returns live 
 
 **Default endpoint:** `ws://localhost:8765`
 
+### What this covers
+
+- A WebSocket service (`main.py`, `app/`) that takes raw 16kHz PCM audio and streams back live partial and final transcripts, using [FunASR](https://github.com/modelscope/FunASR).
+- Turn detection via [vogent-turn](https://github.com/vogent/vogent-turn). Instead of always waiting a fixed 1.5s of silence, a model looks at the trailing audio plus the current transcript and decides whether the speaker is actually done.
+- A browser demo (`examples/browser/`) that records your mic and streams it to the service, so you can try both pieces without writing a client.
+- Docker and Render deploy config (`Dockerfile`, `render.yaml`) for hosting the WebSocket service.
+- A small test suite (`tests/`) covering the deploy config, not the transcription logic itself.
+
 ---
 
 ## Quick start
 
 ```bash
 make install   # create .venv and install dependencies
-make run       # start the WebSocket service on ws://localhost:8765
+make dev       # start the WebSocket service AND the browser demo together
 ```
 
-The service prints `Model ready.` then `Listening on ws://0.0.0.0:8765` when ready.
+Wait for `[service] Model ready.` and `[service] Listening on ws://0.0.0.0:8765` in the terminal, then open `http://localhost:3000`. `make dev` runs both processes under one command and stops both together on Ctrl+C.
+
+Turn detection needs its own Hugging Face token, with access granted on the gated `vogent/Vogent-Turn-80M` model:
+
+```bash
+HF_TOKEN=hf_xxx make dev
+```
+
+No token, or access not yet granted? The service still runs fine, it just falls back to the fixed `SILENCE_MS` timer for ending turns instead of the model.
+
+Port 3000 already taken on your machine:
+
+```bash
+DEMO_PORT=3001 make dev
+```
+
+### Running the WebSocket service and the demo separately
+
+```bash
+make run       # just the WebSocket service, ws://localhost:8765
+make example   # just the browser demo, http://localhost:3000 (or $DEMO_PORT)
+```
+
+Use these instead of `make dev` when you're deploying the WebSocket service on its own, e.g. Render, and don't need the demo page running alongside it.
 
 ### All make commands
 
 | Command | Description |
 |---|---|
 | `make install` | Create `.venv` (Python 3.12) and install dependencies |
-| `make run` | Start the transcription service |
-| `make example` | Serve the browser demo at `http://localhost:3000` |
+| `make dev` | Start the WebSocket service and the browser demo together |
+| `make run` | Start just the transcription service |
+| `make example` | Serve just the browser demo (`DEMO_PORT`, default `3000`) |
 | `make test` | Run deployment/config tests |
 | `make clean` | Remove `__pycache__` directories |
 
@@ -32,6 +64,12 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python main.py
+```
+
+Then, in a second terminal, serve the browser demo:
+
+```bash
+python -m http.server 3000 -d examples/browser
 ```
 
 ## Configuration

@@ -1,4 +1,6 @@
-.PHONY: install run example test clean
+.PHONY: install run example dev test clean
+
+DEMO_PORT ?= 3000
 
 install:
 	python3.12 -m venv .venv
@@ -8,7 +10,13 @@ run:
 	.venv/bin/python main.py
 
 example:
-	python -m http.server 3000 -d examples/browser
+	.venv/bin/python -m http.server $(DEMO_PORT) -d examples/browser
+
+dev:
+	@trap 'kill 0' EXIT INT TERM; \
+	.venv/bin/python main.py & \
+	.venv/bin/python -m http.server $(DEMO_PORT) -d examples/browser & \
+	wait
 
 test:
 	.venv/bin/python -m unittest discover -s tests
