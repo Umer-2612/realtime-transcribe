@@ -5,7 +5,7 @@ import time
 import numpy as np
 import websockets
 
-from app import config
+from app import config, turn_detector
 from app.model import clean, executor, infer_offline, infer_streaming
 
 _conn_counter = 0
@@ -17,15 +17,20 @@ async def handle(websocket):
     conn_id = _conn_counter
     print(f"[conn#{conn_id}] CONNECTED from {websocket.remote_address}", flush=True)
 
-    loop           = asyncio.get_event_loop()
-    chunk_count    = 0
-    last_text      = ""
-    last_speech_at = 0.0
-    session_lang   = config.LANGUAGE
+    loop             = asyncio.get_event_loop()
+    chunk_count      = 0
+    last_text        = ""
+    last_speech_at   = 0.0
+    last_turn_check  = 0.0
+    session_lang     = config.LANGUAGE
+    prev_line        = ""
 
-    cache: dict             = {}
-    audio_buffer: list[np.ndarray] = []
-    _infer_lock             = asyncio.Lock()
+    cache: dict                     = {}
+    audio_buffer: list[np.ndarray]  = []
+    turn_window: list[np.ndarray]   = []
+    turn_window_samples             = 0
+    _infer_lock                     = asyncio.Lock()
+    _turn_lock                      = asyncio.Lock()
 
     await _send(websocket, {"type": "ready"})
 
@@ -61,7 +66,7 @@ async def handle(websocket):
         await _send(websocket, {"type": "partial", "text": text})
 
     async def flush_final(reason: str):
-        nonlocal last_text, last_speech_at
+        nonlocal last_text, last_speech_at, last_turn_check, turn_window_samples
 
         if config.IS_STREAMING:
             tail  = await _run_streaming(np.zeros(160, dtype=np.float32), is_final=True)
@@ -71,24 +76,69 @@ async def handle(websocket):
 
         last_text = ""
         last_speech_at = 0.0
+        last_turn_check = 0.0
         cache.clear()
         audio_buffer.clear()
+        turn_window.clear()
+        turn_window_samples = 0
 
         if final:
             print(f"[conn#{conn_id}] → final ({reason}): {final!r}", flush=True)
             await _send(websocket, {"type": "final", "text": final})
 
-    # ── Silence watchdog ──────────────────────────────────────────────────────
+    # ── Silence / turn watchdog ──────────────────────────────────────────────
+
+    async def _check_turn_complete(silence_ms: float) -> bool:
+        """Ask vogent-turn if the pause looks like a finished turn.
+
+        Debounced separately from the poll interval so a torch.compile-free
+        CPU forward pass (tens of ms) doesn't run on every 100ms tick.
+        """
+        nonlocal last_turn_check
+        if (time.monotonic() - last_turn_check) * 1000 < config.TURN_DEBOUNCE_MS:
+            return False
+        last_turn_check = time.monotonic()
+
+        window_audio = np.concatenate(turn_window) if turn_window else np.zeros(1, dtype=np.float32)
+        try:
+            async with _turn_lock:
+                result = await loop.run_in_executor(
+                    executor, turn_detector.predict, window_audio, prev_line, last_text
+                )
+        except Exception as e:
+            print(f"[conn#{conn_id}] turn-detector inference error: {e!r}", flush=True)
+            return False
+
+        print(
+            f"[conn#{conn_id}] turn check: p_end={result['prob_endpoint']:.2f} "
+            f"silence={silence_ms:.0f}ms curr={last_text!r}",
+            flush=True,
+        )
+        return result["prob_endpoint"] >= config.TURN_PROB_THRESHOLD
 
     async def watchdog():
         while True:
-            await asyncio.sleep(0.2)
-            if last_speech_at and (time.monotonic() - last_speech_at) * 1000 >= config.SILENCE_MS:
-                if last_text or audio_buffer:
-                    try:
-                        await flush_final("silence")
-                    except Exception as e:
-                        print(f"[conn#{conn_id}] watchdog error: {e!r}", flush=True)
+            await asyncio.sleep(0.1)
+            if not last_speech_at or not (last_text or audio_buffer):
+                continue
+
+            silence_ms = (time.monotonic() - last_speech_at) * 1000
+
+            # SILENCE_MS is always the hard ceiling — reached if the model
+            # keeps saying "continue", or if turn detection is unavailable.
+            should_flush = silence_ms >= config.SILENCE_MS
+            reason = "silence_timeout"
+
+            if not should_flush and silence_ms >= config.TURN_DEBOUNCE_MS and turn_detector.available():
+                if await _check_turn_complete(silence_ms):
+                    should_flush = True
+                    reason = "turn_complete"
+
+            if should_flush:
+                try:
+                    await flush_final(reason)
+                except Exception as e:
+                    print(f"[conn#{conn_id}] watchdog error: {e!r}", flush=True)
 
     async def timeout_guard():
         await asyncio.sleep(config.SESSION_TIMEOUT)
@@ -117,7 +167,18 @@ async def handle(websocket):
                 lang = msg.get("language", "").strip()
                 if lang:
                     session_lang = lang
-                print(f"[conn#{conn_id}] ← start  language={session_lang!r}", flush=True)
+                prev_line = msg.get("prev_line", prev_line)
+                print(
+                    f"[conn#{conn_id}] ← start  language={session_lang!r} prev_line={prev_line!r}",
+                    flush=True,
+                )
+
+            elif t == "context":
+                # Interview platform calls this whenever the interviewer asks
+                # a new question, so turn detection has the right prompt for
+                # judging whether the candidate's answer is finished.
+                prev_line = msg.get("prev_line", "")
+                print(f"[conn#{conn_id}] ← context  prev_line={prev_line!r}", flush=True)
 
             elif t == "audio":
                 hex_data = msg.get("data", "")
@@ -136,6 +197,13 @@ async def handle(websocket):
 
                 if is_speech:
                     last_speech_at = time.monotonic()
+
+                if turn_detector.available():
+                    turn_window.append(audio)
+                    turn_window_samples += len(audio)
+                    max_window_samples = int(config.TURN_AUDIO_WINDOW_S * config.SAMPLE_RATE)
+                    while turn_window_samples > max_window_samples and len(turn_window) > 1:
+                        turn_window_samples -= len(turn_window.pop(0))
 
                 if config.IS_STREAMING:
                     await emit_partial(await _run_streaming(audio, is_final=False))
