@@ -1,63 +1,64 @@
-# realtime-transcribe — WebSocket Transcription Service
+# realtime-transcribe
 
-A self-hosted WebSocket service that accepts raw audio streams and returns live transcriptions using [FunASR](https://github.com/modelscope/FunASR).
+A self-hosted WebSocket service for live speech-to-text. You stream raw 16 kHz audio in, and it streams partial and final transcripts back. Transcription runs on [FunASR](https://github.com/modelscope/FunASR).
 
-**Default endpoint:** `ws://localhost:8765`
+It also decides when a speaker has finished talking. A fixed silence timer always waits the full timeout (1.5 s here) before committing a line. This service asks a small turn-detection model, [vogent-turn](https://github.com/vogent/vogent-turn), after 300 ms of silence, so a finished answer can be committed well before the timer runs out. The 1.5 s timer stays as a hard limit.
 
-### What this covers
+```
+mic ──▶ WebSocket ──▶ FunASR ──▶ partial transcripts (~every 1 s)
+                        │
+             silence ≥ 300 ms?
+                        ▼
+                  vogent-turn ──▶ turn finished? ──▶ final transcript
+            (last 8 s of audio + current text
+             + the other speaker's last line)
+```
 
-- A WebSocket service (`main.py`, `app/`) that takes raw 16kHz PCM audio and streams back live partial and final transcripts, using [FunASR](https://github.com/modelscope/FunASR).
-- Turn detection via [vogent-turn](https://github.com/vogent/vogent-turn). Instead of always waiting a fixed 1.5s of silence, a model looks at the trailing audio plus the current transcript and decides whether the speaker is actually done.
-- A browser demo (`examples/browser/`) that records your mic and streams it to the service, so you can try both pieces without writing a client.
-- Docker and Render deploy config (`Dockerfile`, `render.yaml`) for hosting the WebSocket service.
-- A small test suite (`tests/`) covering the deploy config, not the transcription logic itself.
+## What's in the repo
 
----
+| Path | What it is |
+|---|---|
+| `main.py`, `app/` | The WebSocket service: transcription, silence detection and turn detection |
+| `examples/browser/` | A browser demo that records your mic and streams it to the service |
+| `Dockerfile`, `render.yaml` | Container build and a Render blueprint for hosting |
+| `.github/workflows/render-keepalive.yml` | Pings the hosted service every 10 minutes |
+| `tests/` | Tests for the deploy config (the transcription logic has no tests yet) |
 
 ## Quick start
+
+You need Python 3.12.
 
 ```bash
 make install   # create .venv and install dependencies
 make dev       # start the WebSocket service AND the browser demo together
 ```
 
-Wait for `[service] Model ready.` and `[service] Listening on ws://0.0.0.0:8765` in the terminal, then open `http://localhost:3000`. `make dev` runs both processes under one command and stops both together on Ctrl+C.
+When the terminal shows `[service] Model ready.` and `[service] Listening on ws://0.0.0.0:8765`, open `http://localhost:3000` and start talking. Ctrl+C stops both processes.
 
-Turn detection needs its own Hugging Face token, with access granted on the gated `vogent/Vogent-Turn-80M` model:
+Turn detection uses the gated `vogent/Vogent-Turn-80M` model on Hugging Face. Request access to it, then pass your token:
 
 ```bash
 HF_TOKEN=hf_xxx make dev
 ```
 
-No token, or access not yet granted? The service still runs fine, it just falls back to the fixed `SILENCE_MS` timer for ending turns instead of the model.
+Without a token, or before access is granted, the service still runs. It logs that turn detection is unavailable and ends every turn on the `SILENCE_MS` timer.
 
-Port 3000 already taken on your machine:
+If port 3000 is taken:
 
 ```bash
 DEMO_PORT=3001 make dev
 ```
 
-### Running the WebSocket service and the demo separately
+### Other commands
 
-```bash
-make run       # just the WebSocket service, ws://localhost:8765
-make example   # just the browser demo, http://localhost:3000 (or $DEMO_PORT)
-```
-
-Use these instead of `make dev` when you're deploying the WebSocket service on its own, e.g. Render, and don't need the demo page running alongside it.
-
-### All make commands
-
-| Command | Description |
+| Command | What it does |
 |---|---|
-| `make install` | Create `.venv` (Python 3.12) and install dependencies |
-| `make dev` | Start the WebSocket service and the browser demo together |
-| `make run` | Start just the transcription service |
-| `make example` | Serve just the browser demo (`DEMO_PORT`, default `3000`) |
-| `make test` | Run deployment/config tests |
+| `make run` | Start only the WebSocket service on `ws://localhost:8765` |
+| `make example` | Serve only the browser demo on `http://localhost:3000` (or `$DEMO_PORT`) |
+| `make test` | Run the deploy config tests |
 | `make clean` | Remove `__pycache__` directories |
 
-### Without make
+Without make:
 
 ```bash
 python3.12 -m venv .venv
@@ -66,246 +67,61 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Then, in a second terminal, serve the browser demo:
+Then serve the demo from a second terminal:
 
 ```bash
 python -m http.server 3000 -d examples/browser
 ```
 
+## How it works
+
+1. The client sends 256 ms chunks of 16 kHz mono Int16 PCM, hex encoded, over the WebSocket.
+2. Each chunk's RMS level is compared with `RMS_THRESHOLD` to tell speech from silence.
+3. With the default offline model, the service re-transcribes the buffered audio every 4 chunks (about 1 s) while you speak and sends a `partial`. Streaming models can send a partial on every chunk.
+4. A watchdog runs every 100 ms. Once silence reaches `TURN_DEBOUNCE_MS` (300 ms), it passes the last `TURN_AUDIO_WINDOW_S` seconds of audio, the current transcript and the other speaker's last line (`prev_line`) to vogent-turn. It re-checks at most every 300 ms.
+5. If the model's end-of-turn probability reaches `TURN_PROB_THRESHOLD` (0.5), the service sends a `final` and clears the buffer. If it never does, `SILENCE_MS` (1500 ms) forces the `final`.
+
+`prev_line` gives the model the other side of the conversation. In an interview, a pause after "My phone number is" should not end the answer, and knowing the question was "What is your phone number" helps the model see that.
+
 ## Configuration
 
-All settings are controlled via environment variables.
+Everything is set through environment variables. `.env.example` lists the basic ones.
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `8765` | WebSocket port |
-| `MODEL_ID` | `iic/SenseVoiceSmall` | FunASR model. See models below. |
-| `LANGUAGE` | `en` | Default language hint (`en`, `zh`, `ja`, `ko`, `auto`) |
-| `SILENCE_MS` | `1500` | Silence duration (ms) that forces a final flush. Hard ceiling even with turn detection on |
-| `RMS_THRESHOLD` | `0.01` | RMS level below which audio is treated as silence |
-| `SESSION_TIMEOUT` | `600` | Seconds before an idle session is closed |
-| `TURN_DETECTION_ENABLED` | `true` | Use [vogent-turn](https://github.com/vogent/vogent-turn) to end turns on model confidence instead of waiting the full `SILENCE_MS`. Requires an `HF_TOKEN` with access granted to the gated `vogent/Vogent-Turn-80M` repo; falls back to the plain `SILENCE_MS` timer if the model can't load |
-| `TURN_MODEL_ID` | `vogent/Vogent-Turn-80M` | Hugging Face model id for turn detection |
+| `PORT` | `8765` | WebSocket and health check port |
+| `MODEL_ID` | `iic/SenseVoiceSmall` | FunASR model (see below) |
+| `LANGUAGE` | `en` | Default language: `en`, `zh`, `ja`, `ko`, `yue` or `auto` |
+| `SILENCE_MS` | `1500` | Silence in ms that always forces a `final`, with or without turn detection |
+| `RMS_THRESHOLD` | `0.01` | RMS level below which audio counts as silence |
+| `SESSION_TIMEOUT` | `600` | Maximum session length in seconds, counted from connect. The service then sends `timeout` and closes the connection |
+| `HF_TOKEN` | *(none)* | Hugging Face token with access to `vogent/Vogent-Turn-80M` |
+| `TURN_DETECTION_ENABLED` | `true` | Set to `false` to use only the `SILENCE_MS` timer |
+| `TURN_MODEL_ID` | `vogent/Vogent-Turn-80M` | Turn-detection model on Hugging Face |
 | `TURN_MODEL_REVISION` | *(none)* | Pin a specific model revision |
-| `TURN_COMPILE_MODEL` | `false` | Enable `torch.compile` for the turn model (slower startup, faster inference) |
-| `TURN_PROB_THRESHOLD` | `0.5` | Minimum `prob_endpoint` to treat a pause as a finished turn |
-| `TURN_DEBOUNCE_MS` | `300` | Silence (ms) before the first turn-detector check; also the minimum gap between checks |
-| `TURN_AUDIO_WINDOW_S` | `8` | Seconds of trailing audio fed to the turn detector (model max is 8s) |
+| `TURN_COMPILE_MODEL` | `false` | Run `torch.compile` on the turn model: slower startup, faster checks |
+| `TURN_PROB_THRESHOLD` | `0.5` | End-of-turn probability needed to send a `final` |
+| `TURN_DEBOUNCE_MS` | `300` | Silence before the first turn check, and the minimum gap between checks |
+| `TURN_AUDIO_WINDOW_S` | `8` | Seconds of recent audio sent to the turn model (8 s is its maximum) |
 
 ```bash
-PORT=9000 MODEL_ID=iic/SenseVoiceSmall LANGUAGE=auto make run
+PORT=9000 LANGUAGE=auto HF_TOKEN=hf_xxx make run
 ```
 
-Turn detection needs its own Hugging Face token:
-
-```bash
-HF_TOKEN=hf_xxx make run
-```
-
-### Available models
+### Models
 
 | `MODEL_ID` | Mode | Languages | Latency |
 |---|---|---|---|
-| `iic/SenseVoiceSmall` *(default)* | Offline | en, zh, ja, ko, yue | ~1 s |
+| `iic/SenseVoiceSmall` (default) | Offline | en, zh, ja, ko, yue | ~1 s |
 | `paraformer-zh-streaming` | Streaming | zh only | ~250 ms |
 
-Models are downloaded automatically from ModelScope on first run.
+The first run downloads the model from ModelScope.
 
----
+## WebSocket protocol
 
-## Deploy to Render
+All messages are JSON with a `type` field.
 
-This repo is ready for Render blueprint deploys through `render.yaml`. Render builds the Docker image, injects the configured environment variables, and uses `/health` as the service health check.
-
-### 1. Create the Render service
-
-1. Open Render and choose **New > Blueprint**.
-2. Connect this GitHub repository.
-3. Select the `service` branch, or whichever branch contains `render.yaml`.
-4. Confirm the `realtime-transcribe` web service from `render.yaml`.
-5. Use at least the `standard` instance type. FunASR and Torch are too heavy for small free instances.
-
-If you create the service manually instead of using the blueprint, use these settings:
-
-| Field | Value |
-|---|---|
-| Root Directory | Leave blank / repository root |
-| Runtime | Docker |
-| Dockerfile Path | `./Dockerfile` |
-| Docker Context | `.` |
-| Build Command | Leave blank |
-| Start Command | Leave blank |
-| Health Check Path | `/health` |
-
-Docker services use the `CMD ["python", "main.py"]` instruction in the Dockerfile unless you explicitly set a Docker command.
-
-### 2. Environment variables
-
-The blueprint defines these defaults:
-
-| Variable | Value |
-|---|---|
-| `PORT` | `8765` |
-| `MODEL_ID` | `iic/SenseVoiceSmall` |
-| `LANGUAGE` | `en` |
-| `SILENCE_MS` | `1500` |
-| `RMS_THRESHOLD` | `0.01` |
-| `SESSION_TIMEOUT` | `600` |
-
-### 3. Verify the deployment
-
-Render exposes HTTPS for health checks:
-
-```bash
-curl https://<your-render-service>.onrender.com/health
-```
-
-Expected response:
-
-```json
-{"status":"ok","service":"realtime-transcribe"}
-```
-
-Use WebSocket Secure for transcription traffic:
-
-```text
-wss://<your-render-service>.onrender.com
-```
-
-### 4. Keepalive pings
-
-The repo includes `.github/workflows/render-keepalive.yml`, which pings the Render health endpoint every 10 minutes.
-
-After Render gives you the service URL, add this GitHub repository secret:
-
-```text
-RENDER_SERVICE_URL=https://<your-render-service>.onrender.com
-```
-
-GitHub scheduled workflows run from the repository's default branch, so make sure this workflow is on the default branch if you rely on scheduled pings. You can also run it manually from the **Actions** tab.
-
-### 5. Connect the frontend
-
-Set this in your frontend staging/production environment:
-
-```env
-NEXT_PUBLIC_FUNASR_URL=wss://<your-render-service>.onrender.com
-```
-
-Redeploy the frontend after changing the env.
-
----
-
-## Protocol
-
-### 1. Connect
-
-```
-ws://localhost:8765
-```
-
-On connection the service immediately sends:
-
-```json
-{ "type": "ready" }
-```
-
-Do not send audio until you receive this.
-
----
-
-### 2. Messages you send
-
-#### `start` — begin a session
-
-Send once after `ready`. Optional, but lets you set a per-session language and seed turn-detection context.
-
-```json
-{ "type": "start", "language": "en", "prev_line": "What is your phone number" }
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `language` | string | `en`, `zh`, `ja`, `ko`, `yue`, `auto` — overrides server default |
-| `prev_line` | string | The other speaker's last line (e.g. the interviewer's question). Used by turn detection to judge whether the candidate's answer is finished. Ignored if `TURN_DETECTION_ENABLED` is off |
-
-#### `context` — update turn-detection context mid-session
-
-Send whenever the other speaker's line changes (e.g. the interviewer asks the next question), so turn detection keeps judging pauses against the current prompt instead of a stale one.
-
-```json
-{ "type": "context", "prev_line": "Tell me about a time you disagreed with a teammate" }
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `prev_line` | string | Replaces the session's turn-detection context. Omit or send `""` to clear it |
-
-#### `audio` — stream a chunk
-
-Send continuously while recording. Each chunk must be exactly **256 ms** of audio.
-
-```json
-{ "type": "audio", "data": "1a2b3c..." }
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `data` | string | Hex-encoded **Int16 PCM**, **16 kHz**, **mono**. Each chunk = 4096 samples = 8192 bytes → 16384 hex chars. |
-
-**Audio format:**
-- Sample rate: **16 000 Hz**
-- Encoding: **Int16 (signed 16-bit little-endian)**
-- Channels: **mono**
-- Chunk size: **4096 samples** (256 ms)
-
-#### `end` — stop and flush
-
-Tells the service to finalize any buffered audio and emit the last `final` result.
-
-```json
-{ "type": "end" }
-```
-
----
-
-### 3. Messages you receive
-
-#### `partial` — in-progress transcript
-
-Emitted roughly every 1 second while the speaker is talking. Text may change with each update.
-
-```json
-{ "type": "partial", "text": "hello how are" }
-```
-
-#### `final` — committed transcript
-
-Emitted when a pause looks like a finished turn (via `vogent-turn`, or after `SILENCE_MS` if turn detection is off or unavailable), or when you send `end`. Represents one complete utterance.
-
-```json
-{ "type": "final", "text": "Hello, how are you?" }
-```
-
-#### `timeout`
-
-Session has been idle for `SESSION_TIMEOUT` seconds. Connection is closed after this.
-
-```json
-{ "type": "timeout" }
-```
-
-#### `error`
-
-Sent when the service receives malformed input.
-
-```json
-{ "type": "error", "message": "audio data must be hex-encoded int16 PCM" }
-```
-
----
-
-## Typical session flow
+### Session flow
 
 ```
 CLIENT                          SERVICE
@@ -328,10 +144,65 @@ CLIENT                          SERVICE
   |── disconnect ──────────────────▶|
 ```
 
----
+Wait for `ready` before sending audio.
+
+### Client to service
+
+| Type | When | Fields |
+|---|---|---|
+| `start` | Once after `ready` (optional) | `language` overrides the server default. `prev_line` is the other speaker's last line, used by turn detection |
+| `context` | Whenever the other speaker says something new | `prev_line` replaces the current context. Send `""` to clear it |
+| `audio` | Continuously while recording | `data`: hex-encoded audio chunk (format below) |
+| `end` | When recording stops | Transcribes any buffered audio and sends the last `final` |
+
+```json
+{ "type": "start", "language": "en", "prev_line": "What is your phone number" }
+{ "type": "context", "prev_line": "Tell me about a time you disagreed with a teammate" }
+{ "type": "audio", "data": "1a2b3c..." }
+{ "type": "end" }
+```
+
+Audio chunks are 16,000 Hz, mono, signed 16-bit little-endian PCM. Send 4096 samples (256 ms) per chunk: 8192 bytes, or 16,384 hex characters. The partial timing assumes this chunk size.
+
+### Service to client
+
+| Type | Meaning |
+|---|---|
+| `ready` | Connection is open. Start sending audio |
+| `partial` | Transcript so far for the current turn. It can change on the next update |
+| `final` | One finished turn, sent after turn detection, the `SILENCE_MS` limit, or `end` |
+| `timeout` | `SESSION_TIMEOUT` was reached. The connection closes next |
+| `error` | The message was not valid JSON, had an unknown `type`, or carried audio that isn't hex |
+
+```json
+{ "type": "partial", "text": "hello how are" }
+{ "type": "final", "text": "Hello, how are you?" }
+{ "type": "error", "message": "data must be hex-encoded int16 PCM" }
+```
+
+## Deploy to Render
+
+`render.yaml` defines a Docker web service on the `standard` plan with `/health` as its health check. FunASR and PyTorch are too heavy for Render's free instances.
+
+1. In Render, choose **New > Blueprint** and connect this repository (`main` branch).
+2. Confirm the `realtime-transcribe` service.
+3. Add `HF_TOKEN` under the service's environment variables. The blueprint doesn't set it, so without it the service runs with the silence timer only.
+
+For a manual setup, pick the Docker runtime with `./Dockerfile`, context `.`, and health check path `/health`. Leave the build and start commands empty; the Dockerfile runs `python main.py`.
+
+Check the deployment:
+
+```bash
+curl https://<your-render-service>.onrender.com/health
+# {"status":"ok","service":"realtime-transcribe"}
+```
+
+Clients connect over `wss://<your-render-service>.onrender.com`.
+
+To turn on keepalive pings, add a repository secret `RENDER_SERVICE_URL=https://<your-render-service>.onrender.com`. The keepalive workflow then pings `/health` every 10 minutes. GitHub only runs scheduled workflows from the default branch, and you can also start it from the Actions tab.
 
 ## Requirements
 
 - Python 3.12
-- PyTorch 2.0+ (CPU or CUDA)
-- Dependencies: `pip install -r requirements.txt`
+- PyTorch 2.0 or later, on CPU or CUDA
+- Everything else is in `requirements.txt`
